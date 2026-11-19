@@ -1,0 +1,12 @@
+{
+  "name": "divination-tarot",
+  "version": "17.1.0",
+  "description": "Divination Tarot v17.1.0 Sanctuary",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node api/index.js"
+  }
+}
