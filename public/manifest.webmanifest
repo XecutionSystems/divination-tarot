@@ -1,0 +1,9 @@
+{
+  "name": "Divination Tarot v17.1.0 Sanctuary",
+  "short_name": "Divination Tarot",
+  "description": "78-Card Rider-Waite-Smith Living Deck, Tactile Reading Table, Aura AI Live Teleprompter, Arcane Forge, Seeker CRM, Creator Marketplace, and Divination Academy.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0914",
+  "theme_color": "#c9a227"
+}
