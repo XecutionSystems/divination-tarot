@@ -2,8 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index.js" },
-    { "source": "/", "destination": "/index (1).html" },
-    { "source": "/((?!api/|manifest\\.webmanifest|index).*)", "destination": "/index (1).html" }
+    { "source": "/", "destination": "/index%20%281%29.html" },
+    { "source": "/((?!api/|manifest\\.webmanifest|index).*)", "destination": "/index%20%281%29.html" }
   ],
   "headers": [
     {
