@@ -133,6 +133,70 @@ async function buildBootstrap(db, userRow, csrfToken) {
   };
 }
 
+function scrubPii(txt) {
+  return String(txt || '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[REDACTED_EMAIL]')
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, '[REDACTED_PHONE]')
+    .slice(0, 600);
+}
+
+async function callGeminiFlash(systemInstruction, userPrompt) {
+  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK]
+    .flatMap((v) => String(v || '').split(/[|,]/))
+    .map((k) => k.trim())
+    .filter(Boolean);
+  if (!keys.length) return null;
+  const models = Array.from(new Set([process.env.GEMINI_TEXT_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean)));
+  for (const apiKey of keys) {
+    for (const model of models) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents: [{ role: 'user', parts: [{ text: scrubPii(userPrompt) }] }],
+        generationConfig: { temperature: 0.65, maxOutputTokens: 420 }
+      }),
+      signal: ctrl.signal
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+      const txt = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
+      if (txt) return txt;
+    } catch (_) {
+    } finally {
+      clearTimeout(t);
+    }
+    }
+  }
+  return null;
+}
+
+async function sendResendEmail({ to, subject, html, text }) {
+  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
+  if (!apiKey || !to) return { sent: false, provider: 'outbox-only' };
+  const fromAddr = process.env.EMAIL_FROM_ADDRESS || 'Divination Tarot Sanctuary <onboarding@resend.dev>';
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 7000);
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ from: fromAddr, to: [to], subject, html, text }),
+      signal: ctrl.signal
+    });
+    const body = await resp.json().catch(() => ({}));
+    return { sent: resp.ok, provider: 'resend', messageId: body.id || null, status: resp.status };
+  } catch (_) {
+    return { sent: false, provider: 'resend-error' };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 function resolveRp(req) {
   const base = process.env.PUBLIC_BASE_URL || 'https://divination-tarot-pi.vercel.app';
   let rpId = 'divination-tarot-pi.vercel.app';
@@ -151,15 +215,15 @@ module.exports = async function handler(req, res) {
 
   try {
     if (p === '/api/health') {
-      return send(res, 200, { status: 'ok', service: 'Divination Tarot Engine', version: '18.1.0', driver: db ? 'postgres' : 'local-fallback', canonicalCards: 78 });
+      return send(res, 200, { status: 'ok', service: 'Divination Tarot Engine', version: '18.2.0', driver: db ? 'postgres' : 'local-fallback', aiConfigured: Boolean(process.env.GEMINI_API_KEY), emailConfigured: Boolean(process.env.RESEND_API_KEY), canonicalCards: 78 });
     }
     if (p === '/api/readyz') {
-      if (!db) return send(res, 200, { ready: true, version: '18.1.0', driver: 'local-fallback' });
+      if (!db) return send(res, 200, { ready: true, version: '18.2.0', driver: 'local-fallback' });
       const { rows } = await db.query("SELECT count(*)::int AS cnt FROM pg_tables WHERE schemaname = 'public'");
-      return send(res, 200, { ready: rows[0].cnt >= 50, version: '18.1.0', driver: 'postgres', publicTables: rows[0].cnt });
+      return send(res, 200, { ready: rows[0].cnt >= 50, version: '18.2.0', driver: 'postgres', publicTables: rows[0].cnt });
     }
     if (p === '/api/public/rollout-status') {
-      return send(res, 200, { ok: true, version: '18.1.0', registrationMode: 'open', livePaymentsApproved: false });
+      return send(res, 200, { ok: true, version: '18.2.0', registrationMode: 'open', livePaymentsApproved: false });
     }
     if (p === '/api/legal/policies') {
       return send(res, 200, { ok: true, version: '2026.11-rc1', policies: [] });
@@ -173,8 +237,17 @@ module.exports = async function handler(req, res) {
         const orient = dc.orientation === 'reversed' ? 'Reversed' : 'Upright';
         return { positionLabel: dc.position_label || `Slot ${i + 1}`, cardName: c.full, orientation: orient, activeOutput: `Anchor ${c.full} (${orient}) around "${q}" with grounded agency.`, symbolicTooltips: [c.arcana, c.suit] };
       });
+      const aiSummary = await callGeminiFlash(
+        'You are Aura, a reflective, non-deterministic Tarot Sanctuary mentor. Never make medical, legal, or financial predictions. Keep synthesis under 90 words.',
+        `Seeker inquiry: "${q}". Drawn spread: ${cardCues.map((c) => `${c.positionLabel}: ${c.cardName} (${c.orientation})`).join('; ') || 'Single reflective draw'}. Offer a warm, grounded synthesis.`
+      );
+      if (aiSummary && cardCues.length > 0) {
+        cardCues[0].activeOutput = aiSummary;
+      }
+      
       return send(res, 200, {
         ok: true,
+        provider: aiSummary ? 'gemini-2.5-flash' : 'canonical-deterministic',
         teleprompter: {
           rankLabel: String(body.user_rank || 'Novice'),
           cardCues,
@@ -272,6 +345,13 @@ module.exports = async function handler(req, res) {
       } finally {
         client.release();
       }
+      await sendResendEmail({
+        to: email,
+        subject: 'Welcome to Divination Tarot Sanctuary — Your 78-Card Living Deck is Consecrated',
+        html: `<div style="font-family:Georgia,serif;background:#120f24;color:#f8fafc;padding:24px;border-radius:12px;border:1px solid #d4af37"><h2 style="color:#fcd34d;margin-top:0">Welcome, ${displayName} (${handle})</h2><p>Your consecrated 78-card Living Tarot Deck is active in the Sanctuary. Private reading and CRM notes remain strictly encrypted and are never included in emails.</p></div>`,
+        text: `Welcome to Divination Tarot Sanctuary, ${displayName} (${handle})! Your 78-card Living Deck is ready.`
+      });
+      
       res.setHeader('Set-Cookie', `div_sid=${encodeURIComponent(rawTok)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`);
       const uRow = (await db.query('SELECT * FROM users WHERE id = $1', [userId])).rows[0];
       return send(res, 201, await buildBootstrap(db, uRow, csrf));
@@ -402,6 +482,47 @@ module.exports = async function handler(req, res) {
     if (p === '/api/blueprint/status' && m === 'GET') {
       return send(res, 200, { ok: true, rank: { key: auth.blueprint_rank || 'novice' }, immortalDeckProgress: { immortalSlots: 0, requiredSlots: 78 } });
     }
+    
+    if (p.startsWith('/api/ai/assistants/') && m === 'POST') {
+      const role = decodeURIComponent(p.split('/').pop());
+      const b = await readBody(req);
+      const prompt = String(b.prompt || 'Explain Major Arcana structure.');
+      const aiText = await callGeminiFlash(
+        `You are the Divination Tarot ${role.replace(/_/g, ' ')}. Offer reflective, historically grounded symbolism insights under 140 words without deterministic fortune-telling.`,
+        prompt
+      );
+      return send(res, 200, {
+        ok: true,
+        provider: aiText ? 'gemini-2.5-flash' : 'canonical-deterministic',
+        response: aiText || '[Canonical Synthesis] Tarot symbolism invites reflective dialogue between archetypal structure and personal agency.'
+      });
+    }
+    if (p === '/api/auth/verify-email/request' && m === 'POST') {
+      const rawTok = b64u(crypto.randomBytes(24));
+      await db.query(
+        `INSERT INTO account_security_tokens (id, user_id, token_purpose, token_sha256, target_email, expires_at) VALUES ($1,$2,'email_verification',$3,$4,$5)`,
+        [uid('stk'), auth.id, sha256(rawTok), auth.email, new Date(Date.now() + 3600000).toISOString()]
+      );
+      const delivery = await sendResendEmail({
+        to: auth.email,
+        subject: 'Verify Your Divination Tarot Sanctuary Email',
+        html: `<div style="font-family:Georgia,serif;background:#120f24;color:#f8fafc;padding:24px;border-radius:12px;border:1px solid #d4af37"><h2 style="color:#fcd34d;margin-top:0">Verify Your Sanctuary Email</h2><p>Enter verification code: <strong style="color:#6ee7b7">${rawTok}</strong></p></div>`,
+        text: `Verify your Divination Tarot Sanctuary email with token: ${rawTok}`
+      });
+      return send(res, 200, { ok: true, emailSent: delivery.sent, provider: delivery.provider, ...(delivery.sent ? {} : { sandboxVerificationToken: rawTok }) });
+    }
+    if (p === '/api/auth/verify-email/confirm' && m === 'POST') {
+      const b = await readBody(req);
+      const r = await db.query(
+        `SELECT id FROM account_security_tokens WHERE user_id = $1 AND token_purpose = 'email_verification' AND token_sha256 = $2 AND consumed_at IS NULL AND expires_at > $3 LIMIT 1`,
+        [auth.id, sha256(String(b.token || '').trim()), new Date().toISOString()]
+      );
+      if (!r.rows[0]) return send(res, 400, { error: { message: 'Invalid or expired verification token.' } });
+      await db.query('UPDATE account_security_tokens SET consumed_at = CURRENT_TIMESTAMP WHERE id = $1', [r.rows[0].id]);
+      await db.query('UPDATE users SET email_verified = 1, email_verified_at = CURRENT_TIMESTAMP WHERE id = $1', [auth.id]);
+      return send(res, 200, { ok: true, emailVerified: true });
+    } 
+    //}
 
     return send(res, 404, { error: { code: 'NOT_FOUND', message: `Route ${m} ${p} not found.` } });
   } catch (err) {
